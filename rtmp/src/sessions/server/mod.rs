@@ -1024,6 +1024,7 @@ impl ServerSession {
         &mut self,
         size: u32,
     ) -> Result<Vec<ServerSessionResult>, ServerSessionError> {
+        log::info!("RTMP: Client set chunk size to {} bytes", size);
         self.deserializer.set_max_chunk_size(size as usize)?;
         Ok(Vec::new())
     }
