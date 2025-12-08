@@ -368,7 +368,8 @@ impl ChunkDeserializer {
     ) -> Result<ParseStageResult, ChunkDeserializationError> {
         let mut length = self.current_header.message_length as usize;
         let current_payload_length = self.current_payload_data.len();
-        let remaining_bytes = length - current_payload_length;
+        // Use saturating_sub to prevent underflow panic when payload exceeds expected length
+        let remaining_bytes = length.saturating_sub(current_payload_length);
         if length > self.max_chunk_size as usize {
             length = min(remaining_bytes, self.max_chunk_size as usize);
         }
