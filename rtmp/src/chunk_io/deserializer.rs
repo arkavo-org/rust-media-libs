@@ -211,11 +211,26 @@ impl ChunkDeserializer {
             ChunkHeaderFormat::Full => {
                 let mut new_header = ChunkHeader::new();
                 new_header.chunk_stream_id = csid;
+                // Log new chunk streams being registered (first Type 0 header)
+                if !self.previous_headers.contains_key(&csid) {
+                    log::debug!("RTMP: New chunk stream registered: csid={}", csid);
+                }
                 new_header
             }
 
             _ => match self.previous_headers.remove(&csid) {
-                None => return Err(ChunkDeserializationError::NoPreviousChunkOnStream { csid }),
+                None => {
+                    // Log which chunk streams ARE known when we get an unknown one
+                    let known_csids: Vec<u32> = self.previous_headers.keys().copied().collect();
+                    log::error!(
+                        "RTMP: Unknown csid {} (fmt={:?}), known csids: {:?}, buffer_len={}",
+                        csid,
+                        self.current_header_format,
+                        known_csids,
+                        self.buffer.len()
+                    );
+                    return Err(ChunkDeserializationError::NoPreviousChunkOnStream { csid });
+                }
                 Some(header) => header,
             },
         };
