@@ -25,7 +25,12 @@ pub struct ChunkDeserializer {
     current_payload_data: BytesMut,
     buffer: BytesMut,
     previous_headers: HashMap<u32, ChunkHeader>,
+    /// Count of consecutive parse errors (for error threshold)
+    consecutive_errors: u32,
 }
+
+/// Maximum consecutive errors before giving up
+const MAX_CONSECUTIVE_ERRORS: u32 = 5;
 
 enum ParsedValue<T> {
     NotEnoughBytes,
@@ -63,6 +68,7 @@ impl ChunkDeserializer {
             previous_headers: HashMap::new(),
             current_payload: MessagePayload::new(),
             current_payload_data: BytesMut::new(),
+            consecutive_errors: 0,
         }
     }
 
@@ -222,16 +228,39 @@ impl ChunkDeserializer {
                 None => {
                     // Log which chunk streams ARE known when we get an unknown one
                     let known_csids: Vec<u32> = self.previous_headers.keys().copied().collect();
-                    log::error!(
-                        "RTMP: Unknown csid {} (fmt={:?}), known csids: {:?}, buffer_len={}",
+                    self.consecutive_errors += 1;
+
+                    if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        log::error!(
+                            "RTMP: Too many consecutive errors ({}), failing. Unknown csid {} (fmt={:?}), known csids: {:?}",
+                            self.consecutive_errors,
+                            csid,
+                            self.current_header_format,
+                            known_csids
+                        );
+                        return Err(ChunkDeserializationError::NoPreviousChunkOnStream { csid });
+                    }
+
+                    log::warn!(
+                        "RTMP: Unknown csid {} (fmt={:?}), known csids: {:?}, error {}/{} - creating default header",
                         csid,
                         self.current_header_format,
                         known_csids,
-                        self.buffer.len()
+                        self.consecutive_errors,
+                        MAX_CONSECUTIVE_ERRORS
                     );
-                    return Err(ChunkDeserializationError::NoPreviousChunkOnStream { csid });
+
+                    // Create a default header to try to continue
+                    // This is a recovery attempt - the data may be corrupt but we'll try
+                    let mut new_header = ChunkHeader::new();
+                    new_header.chunk_stream_id = csid;
+                    new_header
                 }
-                Some(header) => header,
+                Some(header) => {
+                    // Reset error count on successful header lookup
+                    self.consecutive_errors = 0;
+                    header
+                }
             },
         };
 
