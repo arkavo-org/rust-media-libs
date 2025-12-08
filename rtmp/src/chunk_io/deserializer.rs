@@ -414,6 +414,19 @@ impl ChunkDeserializer {
         let current_payload_length = self.current_payload_data.len();
         // Use saturating_sub to prevent underflow panic when payload exceeds expected length
         let remaining_bytes = length.saturating_sub(current_payload_length);
+
+        // Debug: Log unusual state that might indicate desync
+        if current_payload_length > length {
+            log::error!(
+                "RTMP DESYNC: payload_len ({}) > message_len ({}), csid={}, type_id={}, buffer_len={}",
+                current_payload_length,
+                length,
+                self.current_header.chunk_stream_id,
+                self.current_header.message_type_id,
+                self.buffer.len()
+            );
+        }
+
         if length > self.max_chunk_size as usize {
             length = min(remaining_bytes, self.max_chunk_size as usize);
         }
@@ -438,11 +451,25 @@ impl ChunkDeserializer {
 
         // Check if this completes the message
         if self.current_payload_data.len() == self.current_header.message_length as usize {
+            log::trace!(
+                "RTMP: Message complete csid={}, type_id={}, len={}",
+                self.current_header.chunk_stream_id,
+                self.current_header.message_type_id,
+                self.current_header.message_length
+            );
             let data = mem::replace(&mut self.current_payload_data, BytesMut::new());
             self.current_payload.data = data.freeze();
 
             let payload = mem::replace(&mut self.current_payload, MessagePayload::new());
             *message_to_return = Some(payload)
+        } else {
+            log::trace!(
+                "RTMP: Chunk received csid={}, progress={}/{}, max_chunk={}",
+                self.current_header.chunk_stream_id,
+                self.current_payload_data.len(),
+                self.current_header.message_length,
+                self.max_chunk_size
+            );
         }
 
         // This completes the current chunk, so cycle the header into the map and start a new one
