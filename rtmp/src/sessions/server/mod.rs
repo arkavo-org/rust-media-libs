@@ -502,6 +502,26 @@ impl ServerSession {
             _ => return Err(ServerSessionError::NoAppNameForConnectionRequest),
         };
 
+        // Log client identification info for debugging
+        let flash_ver = properties.get("flashVer").and_then(|v| match v {
+            Amf0Value::Utf8String(s) => Some(s.as_str()),
+            _ => None,
+        });
+        let tc_url = properties.get("tcUrl").and_then(|v| match v {
+            Amf0Value::Utf8String(s) => Some(s.as_str()),
+            _ => None,
+        });
+        let swf_url = properties.get("swfUrl").and_then(|v| match v {
+            Amf0Value::Utf8String(s) => Some(s.as_str()),
+            _ => None,
+        });
+        log::info!(
+            "RTMP connect: flashVer={:?}, tcUrl={:?}, swfUrl={:?}",
+            flash_ver,
+            tc_url,
+            swf_url
+        );
+
         let app_name = match properties.remove("app") {
             Some(value) => match value {
                 Amf0Value::Utf8String(mut app) => {
