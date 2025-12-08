@@ -22,7 +22,10 @@ pub struct ChunkDeserializer {
     current_header: ChunkHeader,
     current_stage: ParseStage,
     current_payload: MessagePayload,
-    current_payload_data: BytesMut,
+    /// Per-csid payload buffers to handle interleaved chunks correctly.
+    /// RTMP allows chunks from different streams to be interleaved, so we need
+    /// separate buffers for each chunk stream ID.
+    csid_payload_data: HashMap<u32, BytesMut>,
     buffer: BytesMut,
     previous_headers: HashMap<u32, ChunkHeader>,
     /// Count of consecutive parse errors (for error threshold)
@@ -67,7 +70,7 @@ impl ChunkDeserializer {
             buffer: BytesMut::with_capacity(4096),
             previous_headers: HashMap::new(),
             current_payload: MessagePayload::new(),
-            current_payload_data: BytesMut::new(),
+            csid_payload_data: HashMap::new(),
             consecutive_errors: 0,
         }
     }
@@ -275,7 +278,9 @@ impl ChunkDeserializer {
             // across multiple chunks.  We need to be careful *NOT* to apply the delta to each
             // type 3 chunk that's trying to serve a single message, otherwise timestamps will
             // get out of control.
-            if self.current_payload_data.len() == 0 {
+            let csid = self.current_header.chunk_stream_id;
+            let payload_len = self.csid_payload_data.get(&csid).map_or(0, |b| b.len());
+            if payload_len == 0 {
                 // Since we don't have any payload data yet, that means this is the first
                 // chunk of the message.  As it's the first chunk this is the only time we should
                 // apply the previous header's delta to the timestamp
@@ -394,9 +399,11 @@ impl ChunkDeserializer {
         }
 
         // If the type 3 chunk is not the first chunk of a message, we just ignore it's extended timestamp because the timestamp of this message was already deserialized.
+        let csid = self.current_header.chunk_stream_id;
+        let payload_len = self.csid_payload_data.get(&csid).map_or(0, |b| b.len());
         if self.current_header_format == ChunkHeaderFormat::Full {
             self.current_header.timestamp.set(timestamp);
-        } else if self.current_payload_data.len() == 0 {
+        } else if payload_len == 0 {
             // Since we already added the MAX_INITIAL_TIMESTAMP to the timestamp, only add the delta difference
             self.current_header.timestamp =
                 self.current_header.timestamp + (timestamp - MAX_INITIAL_TIMESTAMP);
@@ -410,28 +417,33 @@ impl ChunkDeserializer {
         &mut self,
         message_to_return: &mut Option<MessagePayload>,
     ) -> Result<ParseStageResult, ChunkDeserializationError> {
-        let mut length = self.current_header.message_length as usize;
-        let current_payload_length = self.current_payload_data.len();
+        let csid = self.current_header.chunk_stream_id;
+        let message_length = self.current_header.message_length as usize;
+
+        // Get current payload length for this csid
+        let current_payload_length = self.csid_payload_data.get(&csid).map_or(0, |b| b.len());
+
         // Use saturating_sub to prevent underflow panic when payload exceeds expected length
-        let remaining_bytes = length.saturating_sub(current_payload_length);
+        let remaining_bytes = message_length.saturating_sub(current_payload_length);
 
         // Debug: Log unusual state that might indicate desync
-        if current_payload_length > length {
+        if current_payload_length > message_length {
             log::error!(
                 "RTMP DESYNC: payload_len ({}) > message_len ({}), csid={}, type_id={}, buffer_len={}",
                 current_payload_length,
-                length,
-                self.current_header.chunk_stream_id,
+                message_length,
+                csid,
                 self.current_header.message_type_id,
                 self.buffer.len()
             );
+            // Clear the corrupted buffer and start fresh for this csid
+            self.csid_payload_data.remove(&csid);
         }
 
-        if length > self.max_chunk_size as usize {
-            length = min(remaining_bytes, self.max_chunk_size as usize);
-        }
+        // Calculate how many bytes to read in this chunk
+        let bytes_to_read = min(remaining_bytes, self.max_chunk_size);
 
-        if self.buffer.len() < length {
+        if self.buffer.len() < bytes_to_read {
             return Ok(ParseStageResult::NotEnoughBytes);
         }
 
@@ -439,25 +451,31 @@ impl ChunkDeserializer {
         self.current_payload.type_id = self.current_header.message_type_id;
         self.current_payload.message_stream_id = self.current_header.message_stream_id;
 
-        // Make sure the we have enough capacity for the whole message data.  This
+        // Get or create the per-csid payload buffer and ensure capacity
+        let current_payload_data = self.csid_payload_data.entry(csid).or_insert_with(BytesMut::new);
+
+        // Make sure we have enough capacity for the whole message data.  This
         // helps with performance when there are smaller chunk sizes.
-        if remaining_bytes > self.current_payload_data.remaining_mut() {
-            let capacity_needed = remaining_bytes - self.current_payload_data.remaining_mut();
-            self.current_payload_data.reserve(capacity_needed);
+        if remaining_bytes > current_payload_data.remaining_mut() {
+            let capacity_needed = remaining_bytes - current_payload_data.remaining_mut();
+            current_payload_data.reserve(capacity_needed);
         }
 
-        let bytes = self.buffer.split_to(length as usize);
-        self.current_payload_data.extend_from_slice(&bytes[..]);
+        let bytes = self.buffer.split_to(bytes_to_read);
+        current_payload_data.extend_from_slice(&bytes[..]);
+
+        let new_payload_length = current_payload_data.len();
 
         // Check if this completes the message
-        if self.current_payload_data.len() == self.current_header.message_length as usize {
+        if new_payload_length == message_length {
             log::trace!(
                 "RTMP: Message complete csid={}, type_id={}, len={}",
-                self.current_header.chunk_stream_id,
+                csid,
                 self.current_header.message_type_id,
-                self.current_header.message_length
+                message_length
             );
-            let data = mem::replace(&mut self.current_payload_data, BytesMut::new());
+            // Remove the buffer from the map and use it
+            let data = self.csid_payload_data.remove(&csid).unwrap_or_else(BytesMut::new);
             self.current_payload.data = data.freeze();
 
             let payload = mem::replace(&mut self.current_payload, MessagePayload::new());
@@ -465,9 +483,9 @@ impl ChunkDeserializer {
         } else {
             log::trace!(
                 "RTMP: Chunk received csid={}, progress={}/{}, max_chunk={}",
-                self.current_header.chunk_stream_id,
-                self.current_payload_data.len(),
-                self.current_header.message_length,
+                csid,
+                new_payload_length,
+                message_length,
                 self.max_chunk_size
             );
         }
@@ -1071,6 +1089,82 @@ mod tests {
             &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07],
             "Incorrect payload data"
         );
+    }
+
+    #[test]
+    fn can_handle_interleaved_chunks_from_different_csids() {
+        // This test verifies that interleaved chunks from different chunk streams
+        // don't corrupt each other's payload data. This is the root cause fix for
+        // the RTMP desync issue where audio (csid 4) and video (csid 6) chunks
+        // would get their payloads mixed when interleaved.
+        let type_id_audio = 8u8;
+        let type_id_video = 9u8;
+        let audio_payload = [0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA]; // 8 bytes
+        let video_payload = [0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB, 0xBB]; // 8 bytes
+        let max_chunk_size = 4usize;
+
+        // Build chunks manually:
+        // Type 0 header: 1 byte basic header + 3 timestamp + 3 msg_len + 1 type_id + 4 stream_id = 12 bytes
+
+        // csid 4 first chunk (type 0, first 4 bytes of audio)
+        let csid4_chunk1: Vec<u8> = vec![
+            0x04,                   // fmt=0, csid=4
+            0x00, 0x00, 0x64,       // timestamp=100
+            0x00, 0x00, 0x08,       // message_length=8
+            type_id_audio,          // type_id=8
+            0x01, 0x00, 0x00, 0x00, // message_stream_id=1 (little endian)
+            0xAA, 0xAA, 0xAA, 0xAA, // first 4 bytes of payload
+        ];
+
+        // csid 6 first chunk (type 0, first 4 bytes of video) - INTERLEAVED
+        let csid6_chunk1: Vec<u8> = vec![
+            0x06,                   // fmt=0, csid=6
+            0x00, 0x00, 0x64,       // timestamp=100
+            0x00, 0x00, 0x08,       // message_length=8
+            type_id_video,          // type_id=9
+            0x01, 0x00, 0x00, 0x00, // message_stream_id=1 (little endian)
+            0xBB, 0xBB, 0xBB, 0xBB, // first 4 bytes of payload
+        ];
+
+        // csid 4 continuation chunk (type 3, remaining 4 bytes of audio)
+        let csid4_chunk2: Vec<u8> = vec![
+            0xC4,                   // fmt=3, csid=4
+            0xAA, 0xAA, 0xAA, 0xAA, // remaining 4 bytes of payload
+        ];
+
+        // csid 6 continuation chunk (type 3, remaining 4 bytes of video)
+        let csid6_chunk2: Vec<u8> = vec![
+            0xC6,                   // fmt=3, csid=6
+            0xBB, 0xBB, 0xBB, 0xBB, // remaining 4 bytes of payload
+        ];
+
+        let mut deserializer = ChunkDeserializer::new();
+        deserializer.set_max_chunk_size(max_chunk_size).unwrap();
+
+        // Feed interleaved chunks: audio1 -> video1 -> audio2 -> video2
+        // This is the pattern that caused the bug - payloads would get mixed
+
+        // Process csid 4 first chunk - should return None (incomplete)
+        let result1 = deserializer.get_next_message(&csid4_chunk1).unwrap();
+        assert!(result1.is_none(), "Audio chunk 1 should not complete message");
+
+        // Process csid 6 first chunk (interleaved) - should return None (incomplete)
+        let result2 = deserializer.get_next_message(&csid6_chunk1).unwrap();
+        assert!(result2.is_none(), "Video chunk 1 should not complete message");
+
+        // Process csid 4 continuation - should complete audio message
+        let audio_msg = deserializer.get_next_message(&csid4_chunk2).unwrap();
+        assert!(audio_msg.is_some(), "Audio message should be complete");
+        let audio_msg = audio_msg.unwrap();
+        assert_eq!(audio_msg.type_id, type_id_audio, "Audio type_id mismatch");
+        assert_eq!(&audio_msg.data[..], &audio_payload[..], "Audio payload corrupted by interleaving");
+
+        // Process csid 6 continuation - should complete video message
+        let video_msg = deserializer.get_next_message(&csid6_chunk2).unwrap();
+        assert!(video_msg.is_some(), "Video message should be complete");
+        let video_msg = video_msg.unwrap();
+        assert_eq!(video_msg.type_id, type_id_video, "Video type_id mismatch");
+        assert_eq!(&video_msg.data[..], &video_payload[..], "Video payload corrupted by interleaving");
     }
 
     fn form_type_0_chunk(
