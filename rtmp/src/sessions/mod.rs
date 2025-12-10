@@ -47,6 +47,8 @@ pub struct StreamMetadata {
     pub audio_channels: Option<u32>,
     pub audio_is_stereo: Option<bool>,
     pub encoder: Option<String>,
+    /// Custom string fields not part of standard RTMP metadata (e.g., ntdf_header)
+    pub custom_fields: HashMap<String, String>,
 }
 
 impl StreamMetadata {
@@ -64,6 +66,7 @@ impl StreamMetadata {
             audio_channels: None,
             audio_is_stereo: None,
             encoder: None,
+            custom_fields: HashMap::new(),
         }
     }
 
@@ -128,7 +131,12 @@ impl StreamMetadata {
                     None => (),
                 },
 
-                _ => (),
+                // Capture custom string fields (e.g., ntdf_header for NanoTDF streams)
+                _ => {
+                    if let Some(s) = value.get_string() {
+                        self.custom_fields.insert(key, s);
+                    }
+                }
             }
         }
     }

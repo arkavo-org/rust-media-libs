@@ -1,5 +1,6 @@
 use super::PublishMode;
 
+#[allow(dead_code)]
 pub enum StreamState {
     Created,
 

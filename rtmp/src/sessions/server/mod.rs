@@ -347,6 +347,11 @@ impl ServerSession {
             .as_ref()
             .map(|x| properties.insert("encoder".to_string(), Amf0Value::Utf8String(x.clone())));
 
+        // Include custom string fields (e.g., ntdf_header for NanoTDF streams)
+        for (key, value) in &metadata.custom_fields {
+            properties.insert(key.clone(), Amf0Value::Utf8String(value.clone()));
+        }
+
         let message = RtmpMessage::Amf0Data {
             values: vec![
                 Amf0Value::Utf8String("onMetaData".to_string()),

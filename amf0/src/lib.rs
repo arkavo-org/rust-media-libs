@@ -29,7 +29,6 @@
 //! assert_eq!(input, results);
 //! ```
 
-#[macro_use]
 extern crate byteorder;
 extern crate thiserror;
 
