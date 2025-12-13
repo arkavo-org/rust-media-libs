@@ -1104,6 +1104,7 @@ fn can_send_metadata_to_playing_stream() {
         video_frame_rate: Some(107.0),
         video_height: Some(108),
         video_width: Some(109),
+        custom_fields: std::collections::HashMap::new(),
     };
 
     let packet = session.send_metadata(stream_id, &metadata).unwrap();

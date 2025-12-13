@@ -32,8 +32,8 @@ pub struct ChunkDeserializer {
     consecutive_errors: u32,
 }
 
-/// Maximum consecutive errors before giving up
-const MAX_CONSECUTIVE_ERRORS: u32 = 5;
+/// Maximum consecutive errors before logging at error level (but we keep going)
+const ERROR_LOG_THRESHOLD: u32 = 10;
 
 enum ParsedValue<T> {
     NotEnoughBytes,
@@ -229,34 +229,70 @@ impl ChunkDeserializer {
 
             _ => match self.previous_headers.remove(&csid) {
                 None => {
-                    // Log which chunk streams ARE known when we get an unknown one
-                    let known_csids: Vec<u32> = self.previous_headers.keys().copied().collect();
+                    // Unknown csid with compressed header - this happens with Enhanced RTMP
+                    // or when we've missed packets. Create a synthetic header to recover.
                     self.consecutive_errors += 1;
 
-                    if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        log::error!(
-                            "RTMP: Too many consecutive errors ({}), failing. Unknown csid {} (fmt={:?}), known csids: {:?}",
-                            self.consecutive_errors,
+                    // Log at appropriate level based on error count
+                    if self.consecutive_errors >= ERROR_LOG_THRESHOLD {
+                        if self.consecutive_errors == ERROR_LOG_THRESHOLD {
+                            let known_csids: Vec<u32> = self.previous_headers.keys().copied().collect();
+                            log::error!(
+                                "RTMP: Many unknown csids ({} errors), likely Enhanced RTMP or packet loss. Latest: csid {} (fmt={:?}), known: {:?}",
+                                self.consecutive_errors,
+                                csid,
+                                self.current_header_format,
+                                known_csids
+                            );
+                        }
+                        // After threshold, only log every 100th error to reduce spam
+                        else if self.consecutive_errors % 100 == 0 {
+                            log::warn!(
+                                "RTMP: {} total unknown csid errors (continuing to recover)",
+                                self.consecutive_errors
+                            );
+                        }
+                    } else {
+                        let known_csids: Vec<u32> = self.previous_headers.keys().copied().collect();
+                        log::debug!(
+                            "RTMP: Unknown csid {} (fmt={:?}), known csids: {:?} - creating synthetic header",
                             csid,
                             self.current_header_format,
                             known_csids
                         );
-                        return Err(ChunkDeserializationError::NoPreviousChunkOnStream { csid });
                     }
 
-                    log::warn!(
-                        "RTMP: Unknown csid {} (fmt={:?}), known csids: {:?}, error {}/{} - creating default header",
-                        csid,
-                        self.current_header_format,
-                        known_csids,
-                        self.consecutive_errors,
-                        MAX_CONSECUTIVE_ERRORS
-                    );
-
-                    // Create a default header to try to continue
-                    // This is a recovery attempt - the data may be corrupt but we'll try
+                    // Create a synthetic header with reasonable defaults based on csid
+                    // Common RTMP csid assignments:
+                    // - 2: Protocol control
+                    // - 3: AMF invoke/command
+                    // - 4: User control messages
+                    // - 5-6: Often audio/video
+                    // - Higher csids: Often used by Enhanced RTMP for multi-track
                     let mut new_header = ChunkHeader::new();
                     new_header.chunk_stream_id = csid;
+
+                    // For compressed headers without a previous full header, we need to
+                    // make reasonable guesses. The header format tells us what we'll parse:
+                    // - Type 1: we'll read timestamp_delta + msg_length + type_id
+                    // - Type 2: we'll read timestamp_delta only
+                    // - Type 3: we read nothing from header
+                    //
+                    // For types 2 and 3, we need defaults for message_length and type_id
+                    // Set a small default message length - better to think message is done
+                    // than to wait forever for bytes that won't come
+                    match self.current_header_format {
+                        ChunkHeaderFormat::TimeDeltaOnly | ChunkHeaderFormat::Empty => {
+                            // These formats don't include message length, so we need a default
+                            // Use 0 to immediately "complete" the message (skip this bad chunk)
+                            new_header.message_length = 0;
+                            new_header.message_type_id = 0;
+                        }
+                        _ => {
+                            // Type 1 will read message_length from stream
+                        }
+                    }
+
                     new_header
                 }
                 Some(header) => {
@@ -419,6 +455,21 @@ impl ChunkDeserializer {
     ) -> Result<ParseStageResult, ChunkDeserializationError> {
         let csid = self.current_header.chunk_stream_id;
         let message_length = self.current_header.message_length as usize;
+
+        // Handle synthetic headers with message_length=0 (from unknown csid recovery)
+        // Don't return an empty message, just cycle back to look for next valid chunk
+        if message_length == 0 {
+            log::trace!(
+                "RTMP: Skipping empty message for csid={} (likely synthetic header recovery)",
+                csid
+            );
+            // Store the synthetic header so future compressed chunks can reference it
+            let current_header = mem::replace(&mut self.current_header, ChunkHeader::new());
+            self.previous_headers
+                .insert(current_header.chunk_stream_id, current_header);
+            self.current_stage = ParseStage::Csid;
+            return Ok(ParseStageResult::Success);
+        }
 
         // Get current payload length for this csid
         let current_payload_length = self.csid_payload_data.get(&csid).map_or(0, |b| b.len());
@@ -1165,6 +1216,93 @@ mod tests {
         let video_msg = video_msg.unwrap();
         assert_eq!(video_msg.type_id, type_id_video, "Video type_id mismatch");
         assert_eq!(&video_msg.data[..], &video_payload[..], "Video payload corrupted by interleaving");
+    }
+
+    #[test]
+    fn recovers_from_unknown_csid_with_compressed_header() {
+        // This test simulates Enhanced RTMP or packet loss scenarios where we receive
+        // compressed headers (type 2/3) for chunk streams that never had a type 0 header.
+        // The deserializer should skip these unknown chunks and continue processing.
+
+        // First, send a valid type 0 chunk on csid 4
+        let valid_chunk: Vec<u8> = vec![
+            0x04,                   // fmt=0, csid=4
+            0x00, 0x00, 0x64,       // timestamp=100
+            0x00, 0x00, 0x04,       // message_length=4
+            0x09,                   // type_id=9 (video)
+            0x01, 0x00, 0x00, 0x00, // message_stream_id=1
+            0x01, 0x02, 0x03, 0x04, // payload
+        ];
+
+        // Then a type 3 chunk for unknown csid 50 (simulates Enhanced RTMP)
+        let unknown_type3: Vec<u8> = vec![
+            0xF2,                   // fmt=3 (0b11), csid=50 (0b110010)
+            // No header fields for type 3
+            // No payload bytes expected since we'll create synthetic header with len=0
+        ];
+
+        // Then another valid type 0 chunk on csid 6
+        let valid_chunk2: Vec<u8> = vec![
+            0x06,                   // fmt=0, csid=6
+            0x00, 0x00, 0x96,       // timestamp=150
+            0x00, 0x00, 0x03,       // message_length=3
+            0x08,                   // type_id=8 (audio)
+            0x01, 0x00, 0x00, 0x00, // message_stream_id=1
+            0xAA, 0xBB, 0xCC,       // payload
+        ];
+
+        let mut deserializer = ChunkDeserializer::new();
+
+        // Process first valid chunk
+        let msg1 = deserializer.get_next_message(&valid_chunk).unwrap();
+        assert!(msg1.is_some(), "First valid chunk should complete");
+        let msg1 = msg1.unwrap();
+        assert_eq!(msg1.type_id, 9, "First message type_id should be video");
+        assert_eq!(&msg1.data[..], &[0x01, 0x02, 0x03, 0x04]);
+
+        // Process unknown csid chunk - should skip without error
+        let msg2 = deserializer.get_next_message(&unknown_type3).unwrap();
+        assert!(msg2.is_none(), "Unknown csid chunk should be skipped (return None)");
+
+        // Process second valid chunk - should still work after recovery
+        let msg3 = deserializer.get_next_message(&valid_chunk2).unwrap();
+        assert!(msg3.is_some(), "Second valid chunk should complete after recovery");
+        let msg3 = msg3.unwrap();
+        assert_eq!(msg3.type_id, 8, "Third message type_id should be audio");
+        assert_eq!(&msg3.data[..], &[0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn recovers_from_many_unknown_csids_without_failing() {
+        // This test verifies we don't fail even with many consecutive unknown csid errors
+        // (simulating Enhanced RTMP multi-track scenario)
+
+        let mut deserializer = ChunkDeserializer::new();
+
+        // Send 20 type 3 chunks for various unknown csids
+        for csid in 10..30 {
+            let unknown_chunk: Vec<u8> = vec![
+                0xC0 | (csid as u8), // fmt=3, csid=csid
+            ];
+            // Should not panic or return error - just skip
+            let result = deserializer.get_next_message(&unknown_chunk);
+            assert!(result.is_ok(), "Should not error on unknown csid {}", csid);
+        }
+
+        // Now send a valid chunk - should still work
+        let valid_chunk: Vec<u8> = vec![
+            0x04,                   // fmt=0, csid=4
+            0x00, 0x00, 0x64,       // timestamp=100
+            0x00, 0x00, 0x02,       // message_length=2
+            0x09,                   // type_id=9
+            0x01, 0x00, 0x00, 0x00, // message_stream_id=1
+            0xDE, 0xAD,             // payload
+        ];
+
+        let msg = deserializer.get_next_message(&valid_chunk).unwrap();
+        assert!(msg.is_some(), "Valid chunk should work after many unknown csids");
+        let msg = msg.unwrap();
+        assert_eq!(&msg.data[..], &[0xDE, 0xAD]);
     }
 
     fn form_type_0_chunk(
